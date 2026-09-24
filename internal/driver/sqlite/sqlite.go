@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/branchbase/branchbase/internal/driver"
 	"github.com/branchbase/branchbase/internal/git"
@@ -114,7 +115,72 @@ func (d *SqliteDriver) BranchExists(ctx context.Context, branchName string) (boo
 	return false, err
 }
 
-// CreateBranch clones sourceBranch into targetBranch using Copy-on-Write / fast streaming
+// maxSnapshotAttempts bounds how many times CreateBranch retries when the
+// source database is modified (committed writes or a WAL checkpoint) while
+// its files are being copied.
+const maxSnapshotAttempts = 10
+
+// sourceFingerprint captures enough state of the source database file to
+// detect any committed modification: size, modification time, and the first
+// 100 bytes (the SQLite database header, which embeds the file change
+// counter that SQLite increments on every commit touching the main file).
+type sourceFingerprint struct {
+	size    int64
+	modTime time.Time
+	header  []byte
+	exists  bool
+}
+
+func fingerprintSource(path string) (sourceFingerprint, error) {
+	var fp sourceFingerprint
+	info, err := os.Stat(path)
+	if err != nil {
+		return fp, err
+	}
+	fp.size = info.Size()
+	fp.modTime = info.ModTime()
+	fp.exists = true
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fp, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	fp.header = make([]byte, 100)
+	n, _ := f.Read(fp.header)
+	fp.header = fp.header[:n]
+	return fp, nil
+}
+
+func (fp sourceFingerprint) equal(other sourceFingerprint) bool {
+	if !fp.exists || !other.exists {
+		return fp.exists == other.exists
+	}
+	if fp.size != other.size || !fp.modTime.Equal(other.modTime) {
+		return false
+	}
+	if len(fp.header) != len(other.header) {
+		return false
+	}
+	for i := range fp.header {
+		if fp.header[i] != other.header[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// CreateBranch clones sourceBranch into targetBranch using Copy-on-Write / fast streaming.
+//
+// Writers are never paused or locked out. Instead, the snapshot is taken
+// optimistically: the main database file is copied first, then the WAL/SHM
+// sidecars, so the copied WAL always covers at least the frames missing from
+// the copied main file. If the source main file was modified meanwhile —
+// e.g. a WAL checkpoint folding committed frames back into it — the copied
+// pair would be inconsistent (committed changes could be lost), so the copy
+// is discarded and retried.
 func (d *SqliteDriver) CreateBranch(ctx context.Context, sourceBranch, targetBranch string) error {
 	select {
 	case <-ctx.Done():
@@ -145,25 +211,57 @@ func (d *SqliteDriver) CreateBranch(ctx context.Context, sourceBranch, targetBra
 		return fmt.Errorf("failed to create destination directory for %q: %w", targetPath, err)
 	}
 
-	// Clean up any stale target database files
-	_ = os.Remove(targetPath)
-	_ = os.Remove(targetPath + "-wal")
-	_ = os.Remove(targetPath + "-shm")
+	var lastErr error
+	for attempt := 0; attempt < maxSnapshotAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	// Snapshot primary database file
-	if err := CloneFile(sourcePath, targetPath); err != nil {
-		return fmt.Errorf("failed to snapshot sqlite database from %q to %q: %w", sourcePath, targetPath, err)
+		before, err := fingerprintSource(sourcePath)
+		if err != nil {
+			return fmt.Errorf("cannot snapshot source database %q: %w", sourcePath, err)
+		}
+
+		// Clean up any stale target database files
+		_ = os.Remove(targetPath)
+		_ = os.Remove(targetPath + "-wal")
+		_ = os.Remove(targetPath + "-shm")
+
+		// Snapshot primary database file
+		if err := CloneFile(sourcePath, targetPath); err != nil {
+			return fmt.Errorf("failed to snapshot sqlite database from %q to %q: %w", sourcePath, targetPath, err)
+		}
+
+		// Also clone WAL and SHM files if present for consistent crash-recovery state
+		if _, err := os.Stat(sourcePath + "-wal"); err == nil {
+			_ = CloneFile(sourcePath+"-wal", targetPath+"-wal")
+		}
+		if _, err := os.Stat(sourcePath + "-shm"); err == nil {
+			_ = CloneFile(sourcePath+"-shm", targetPath+"-shm")
+		}
+
+		after, err := fingerprintSource(sourcePath)
+		if err != nil {
+			return fmt.Errorf("cannot verify source database %q after snapshot: %w", sourcePath, err)
+		}
+		if before.equal(after) {
+			// The source main file was untouched while we copied: the
+			// (main, WAL) pair is a consistent point-in-time snapshot.
+			return nil
+		}
+
+		// A committed write or WAL checkpoint raced with the copy; the
+		// snapshot may be missing committed changes. Discard and retry.
+		lastErr = fmt.Errorf("source database %q changed during snapshot (attempt %d/%d)", sourcePath, attempt+1, maxSnapshotAttempts)
+		_ = os.Remove(targetPath)
+		_ = os.Remove(targetPath + "-wal")
+		_ = os.Remove(targetPath + "-shm")
+		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
 	}
 
-	// Also clone WAL and SHM files if present for consistent crash-recovery state
-	if _, err := os.Stat(sourcePath + "-wal"); err == nil {
-		_ = CloneFile(sourcePath+"-wal", targetPath+"-wal")
-	}
-	if _, err := os.Stat(sourcePath + "-shm"); err == nil {
-		_ = CloneFile(sourcePath+"-shm", targetPath+"-shm")
-	}
-
-	return nil
+	return fmt.Errorf("failed to obtain a consistent snapshot of %q: %w", sourcePath, lastErr)
 }
 
 // DeleteBranch destroys an ephemeral SQLite database branch along with WAL/SHM artifacts

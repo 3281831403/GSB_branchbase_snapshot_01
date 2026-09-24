@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/branchbase/branchbase/internal/config"
 	"github.com/branchbase/branchbase/internal/driver"
@@ -309,6 +311,21 @@ func Run(ctx context.Context, repoPath string, cfg *config.Config, drv driver.Dr
 		model.SetFlash(fmt.Sprintf("Initial load error: %v", err), "error")
 	}
 
+	// Put the terminal into cbreak mode (no canonical line buffering, no
+	// echo) so key presses arrive immediately and escape sequences such as
+	// arrow keys are not echoed back onto the screen as stray characters.
+	// Only applies when reading from a real terminal; other readers (pipes,
+	// buffers in tests) are left untouched.
+	var termFile *os.File
+	if f, ok := in.(*os.File); ok {
+		if info, err := f.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+			if restore, err := makeRaw(f.Fd()); err == nil {
+				termFile = f
+				defer restore()
+			}
+		}
+	}
+
 	reader := bufio.NewReader(in)
 
 	// Hide cursor and clear screen
@@ -327,42 +344,12 @@ func Run(ctx context.Context, repoPath string, cfg *config.Config, drv driver.Dr
 		default:
 		}
 
-		b, err := reader.ReadByte()
+		key, err := readKey(reader, termFile)
 		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
 			return err
-		}
-
-		var key string
-		switch b {
-		case 27: // Escape character
-			// Check if part of arrow sequence
-			if reader.Buffered() >= 2 {
-				next1, _ := reader.ReadByte()
-				next2, _ := reader.ReadByte()
-				if next1 == '[' {
-					switch next2 {
-					case 'A':
-						key = "up"
-					case 'B':
-						key = "down"
-					case 'C':
-						key = "right"
-					case 'D':
-						key = "left"
-					}
-				}
-			} else {
-				key = "esc"
-			}
-		case '\r', '\n':
-			key = "enter"
-		case 3: // Ctrl+C
-			key = "ctrl+c"
-		default:
-			key = string(b)
 		}
 
 		quit, _ := model.HandleKey(key, ctx)
@@ -373,4 +360,73 @@ func Run(ctx context.Context, repoPath string, cfg *config.Config, drv driver.Dr
 		// Re-render dashboard
 		_, _ = fmt.Fprint(out, ClearScreen+model.RenderView())
 	}
+}
+
+// readKey reads a single logical key press, decoding ANSI escape sequences
+// (such as arrow keys) into the symbolic names understood by HandleKey.
+func readKey(reader *bufio.Reader, termFile *os.File) (string, error) {
+	b, err := reader.ReadByte()
+	if err != nil {
+		return "", err
+	}
+
+	switch b {
+	case 27: // ESC: lone key press or start of an escape sequence
+		return decodeEscapeSequence(reader, termFile), nil
+	case '\r', '\n':
+		return "enter", nil
+	case 3: // Ctrl+C
+		return "ctrl+c", nil
+	default:
+		return string(b), nil
+	}
+}
+
+// decodeEscapeSequence is invoked after an ESC byte and decodes the remainder
+// of a CSI ("ESC [") or SS3 ("ESC O") sequence. A lone ESC with no following
+// bytes is reported as the "esc" key.
+func decodeEscapeSequence(reader *bufio.Reader, termFile *os.File) string {
+	intro, ok := readEscapeByte(reader, termFile)
+	if !ok || (intro != '[' && intro != 'O') {
+		return "esc"
+	}
+
+	final, ok := readEscapeByte(reader, termFile)
+	if !ok {
+		return "esc"
+	}
+
+	switch final {
+	case 'A':
+		return "up"
+	case 'B':
+		return "down"
+	case 'C':
+		return "right"
+	case 'D':
+		return "left"
+	}
+	return "esc"
+}
+
+// readEscapeByte reads one byte of an escape sequence, waiting briefly for
+// the rest of the sequence to arrive when reading from a terminal. It reports
+// false when no byte shows up in time (a lone ESC key press).
+func readEscapeByte(reader *bufio.Reader, termFile *os.File) (byte, bool) {
+	if reader.Buffered() > 0 {
+		b, err := reader.ReadByte()
+		return b, err == nil
+	}
+	if termFile == nil {
+		return 0, false
+	}
+	if err := termFile.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		return 0, false
+	}
+	b, err := reader.ReadByte()
+	_ = termFile.SetReadDeadline(time.Time{})
+	if err != nil {
+		return 0, false
+	}
+	return b, true
 }

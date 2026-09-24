@@ -38,18 +38,34 @@ type Server struct {
 	activeMu     sync.Mutex
 	tlsConfig    *tls.Config
 	drainTimeout time.Duration
+	// handshakeTimeout bounds how long a single connection may spend in the
+	// startup/SSL/TLS negotiation phase. Without it, a client that stalls
+	// mid-handshake (e.g. network partition) pins a goroutine, two file
+	// descriptors, and an already-dialed backend connection forever, so
+	// enough failed handshakes wedge the proxy until it is restarted.
+	handshakeTimeout time.Duration
 }
 
 // NewServer initializes a new transparent proxy server
 func NewServer(cfg *config.Config, repoPath string, drv driver.Driver) *Server {
 	return &Server{
-		cfg:          cfg,
-		repoPath:     repoPath,
-		drv:          drv,
-		keyLock:      newKeyedMutex(),
-		activeConns:  make(map[net.Conn]struct{}),
-		drainTimeout: 500 * time.Millisecond,
+		cfg:              cfg,
+		repoPath:         repoPath,
+		drv:              drv,
+		keyLock:          newKeyedMutex(),
+		activeConns:      make(map[net.Conn]struct{}),
+		drainTimeout:     500 * time.Millisecond,
+		handshakeTimeout: 10 * time.Second,
 	}
+}
+
+// SetHandshakeTimeout configures the maximum duration a connection may spend
+// in the startup/TLS negotiation phase before it is aborted and its resources
+// (including the reserved backend connection) are released.
+func (s *Server) SetHandshakeTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handshakeTimeout = d
 }
 
 // SetDrainTimeout configures the maximum duration to wait for active connections to drain
@@ -70,7 +86,6 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.listener != nil {
 		return fmt.Errorf("server is already running")
 	}
-
 
 	// Initialize TLS if enabled
 	if s.cfg.Proxy.TLS.Enabled {
@@ -235,7 +250,6 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		}
 	}()
 
-
 	for {
 		s.mu.Lock()
 		l := s.listener
@@ -345,10 +359,23 @@ func (s *Server) dialBackend() (net.Conn, string, error) {
 
 func (s *Server) handleConnection(clientConn net.Conn) {
 	s.addActiveConn(clientConn)
-	defer func() {
-		s.removeActiveConn(clientConn)
-		_ = clientConn.Close()
-	}()
+	// Capture the connection by value: clientConn is reassigned to the TLS
+	// wrapper on the SSL upgrade path, and the raw connection must still be
+	// removed from the active set and closed exactly once.
+	defer func(c net.Conn) {
+		s.removeActiveConn(c)
+		_ = c.Close()
+	}(clientConn)
+
+	// Bound the startup/SSL/TLS negotiation phase so that clients stalling
+	// mid-handshake cannot pin this goroutine and the backend connection
+	// (dialed below) indefinitely. The deadline is cleared before streaming.
+	s.mu.Lock()
+	handshakeTimeout := s.handshakeTimeout
+	s.mu.Unlock()
+	if handshakeTimeout > 0 {
+		_ = clientConn.SetDeadline(time.Now().Add(handshakeTimeout))
+	}
 
 	// 1. Resolve active Git branch
 	activeBranch, err := git.ResolveCurrentBranch(s.repoPath)
@@ -418,7 +445,10 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 				return
 			}
 			s.addActiveConn(tlsConn)
-			defer s.removeActiveConn(tlsConn)
+			defer func() {
+				s.removeActiveConn(tlsConn)
+				_ = tlsConn.Close()
+			}()
 			clientConn = tlsConn
 			packet, err = pgwire.ReadStartupPacket(clientConn)
 			if err != nil {
@@ -450,6 +480,12 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	if _, err := backendConn.Write(rewrittenPacket); err != nil {
 		log.Printf("[BranchBase Proxy] Error forwarding startup packet to backend: %v", err)
 		return
+	}
+
+	// Handshake phase completed successfully; clear the negotiation deadline
+	// so long-lived streaming connections are not cut off.
+	if handshakeTimeout > 0 {
+		_ = clientConn.SetDeadline(time.Time{})
 	}
 
 	// 4. Bidirectional streaming
