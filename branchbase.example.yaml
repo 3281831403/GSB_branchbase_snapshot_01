@@ -1,0 +1,36 @@
+# BranchBase Configuration Specification
+# Save this file as .branchbase.yaml or .branchbase.yml in your repository root
+# Environment variable expansion (${ENV_VAR} or $ENV_VAR) is supported across all fields.
+
+version: "1"
+
+# Database engine to manage
+# Supported: postgres, mysql, mariadb, sqlite (planned: mongodb)
+driver: "postgres"
+
+# Target underlying database configuration (e.g. your local Docker container)
+connection:
+  host: "${DB_HOST:-127.0.0.1}"
+  port: 5433             # Real database port where Docker exposes the engine
+  user: "${DB_USER:-postgres}"
+  password: "${DB_PASSWORD:-password}"
+  base_database: "myapp_dev"   # Canonical base database (e.g., matching main/master)
+  # path: "myapp_dev.db"       # For SQLite: path to local database file
+
+# Transparent proxy settings
+proxy:
+  enabled: true
+  listen_port: 5432      # Port your application connects to in DATABASE_URL
+  default_branch: "main" # Fallback branch if Git state is detached or unresolvable
+
+# Lifecycle and branch snapshot strategy
+strategy:
+  # Automatically snapshot/create branch database on git checkout
+  snapshot_on_switch: true
+
+  # Auto prune ephemeral databases when corresponding Git branch is merged
+  auto_prune_merged: false
+
+  # Maximum number of branch databases allowed simultaneously (safeguard against disk exhaustion)
+  max_branch_databases: 10
+

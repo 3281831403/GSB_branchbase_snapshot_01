@@ -1,0 +1,190 @@
+package hook
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestInstallAndUninstallHooks(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	gitDir := filepath.Join(tempDir, ".git")
+	if err := os.Mkdir(gitDir, 0755); err != nil {
+		t.Fatalf("failed to create .git: %v", err)
+	}
+
+	// 1. Install
+	if err := InstallHooks(tempDir); err != nil {
+		t.Fatalf("InstallHooks failed: %v", err)
+	}
+
+	if !AreHooksInstalled(tempDir) {
+		t.Errorf("expected hooks to be installed")
+	}
+
+	// 2. Re-install should be idempotent
+	if err := InstallHooks(tempDir); err != nil {
+		t.Fatalf("Idempotent InstallHooks failed: %v", err)
+	}
+
+	// 3. Uninstall
+	if err := UninstallHooks(tempDir); err != nil {
+		t.Fatalf("UninstallHooks failed: %v", err)
+	}
+
+	if AreHooksInstalled(tempDir) {
+		t.Errorf("expected hooks to be uninstalled")
+	}
+}
+
+func TestInstallHooksNotGitRepo(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	err := InstallHooks(tempDir)
+	if err != ErrNotGitRepository {
+		t.Fatalf("expected ErrNotGitRepository, got: %v", err)
+	}
+}
+
+func TestAreHooksInstalledFalseWhenMissing(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	if AreHooksInstalled(tempDir) {
+		t.Errorf("expected AreHooksInstalled to return false for empty dir")
+	}
+}
+
+func TestUninstallHooksCorruptedMarkers(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	hooksDir := filepath.Join(tempDir, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatalf("mkdir hooks: %v", err)
+	}
+
+	// Reversed markers: end before start
+	corrupted := "#!/bin/sh\n" + hookMarkerEnd + "\necho hi\n" + hookMarkerStart + "\n"
+	hookFile := filepath.Join(hooksDir, "post-checkout")
+	if err := os.WriteFile(hookFile, []byte(corrupted), 0755); err != nil {
+		t.Fatalf("write hook: %v", err)
+	}
+
+	err := UninstallHooks(tempDir)
+	if err == nil {
+		t.Fatalf("expected error for corrupted markers, got nil")
+	}
+	if !strings.Contains(err.Error(), "corrupted branchbase hook markers") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// File should be left alone
+	data, readErr := os.ReadFile(hookFile)
+	if readErr != nil {
+		t.Fatalf("hook file should remain: %v", readErr)
+	}
+	if string(data) != corrupted {
+		t.Fatalf("hook file was modified despite corruption")
+	}
+}
+
+func TestInstallHooksEnsuresExecutablePermission(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	gitHooksDir := filepath.Join(tempDir, ".git", "hooks")
+	if err := os.MkdirAll(gitHooksDir, 0755); err != nil {
+		t.Fatalf("mkdir .git/hooks: %v", err)
+	}
+
+	// Pre-create post-checkout with 0644 (non-executable)
+	preExistingHook := filepath.Join(gitHooksDir, "post-checkout")
+	if err := os.WriteFile(preExistingHook, []byte("#!/bin/sh\necho custom\n"), 0644); err != nil {
+		t.Fatalf("write pre-existing hook: %v", err)
+	}
+
+	if err := InstallHooks(tempDir); err != nil {
+		t.Fatalf("InstallHooks failed: %v", err)
+	}
+
+	fi, err := os.Stat(preExistingHook)
+	if err != nil {
+		t.Fatalf("stat hook failed: %v", err)
+	}
+
+	if !strings.Contains(string(fi.Name()), "post-checkout") {
+		t.Fatalf("unexpected hook file name: %s", fi.Name())
+	}
+}
+
+func TestInstallHooksWorktree(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// 1. Setup main repo .git directory
+	mainGitDir := filepath.Join(tempDir, "main_repo", ".git")
+	mainHooksDir := filepath.Join(mainGitDir, "hooks")
+	if err := os.MkdirAll(mainHooksDir, 0755); err != nil {
+		t.Fatalf("mkdir mainHooksDir: %v", err)
+	}
+
+	// 2. Setup worktree gitdir with commondir pointing back to main .git
+	wtGitDir := filepath.Join(mainGitDir, "worktrees", "wt1")
+	if err := os.MkdirAll(wtGitDir, 0755); err != nil {
+		t.Fatalf("mkdir wtGitDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtGitDir, "commondir"), []byte("../../\n"), 0644); err != nil {
+		t.Fatalf("write commondir: %v", err)
+	}
+
+	// 3. Setup worktree working copy with .git file
+	wtWorkDir := filepath.Join(tempDir, "worktree_copy")
+	if err := os.MkdirAll(wtWorkDir, 0755); err != nil {
+		t.Fatalf("mkdir wtWorkDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtWorkDir, ".git"), []byte("gitdir: "+wtGitDir+"\n"), 0644); err != nil {
+		t.Fatalf("write .git file: %v", err)
+	}
+
+	// 4. Test InstallHooks from worktree working copy
+	if err := InstallHooks(wtWorkDir); err != nil {
+		t.Fatalf("InstallHooks failed for worktree: %v", err)
+	}
+
+	if !AreHooksInstalled(wtWorkDir) {
+		t.Errorf("expected AreHooksInstalled to return true for worktree")
+	}
+
+	// Verify hooks were installed in mainHooksDir (commondir)
+	postCheckout := filepath.Join(mainHooksDir, "post-checkout")
+	if _, err := os.Stat(postCheckout); err != nil {
+		t.Fatalf("expected post-checkout hook to exist in commondir: %v", err)
+	}
+
+	// 5. Test UninstallHooks from worktree working copy
+	if err := UninstallHooks(wtWorkDir); err != nil {
+		t.Fatalf("UninstallHooks failed for worktree: %v", err)
+	}
+
+	if AreHooksInstalled(wtWorkDir) {
+		t.Errorf("expected AreHooksInstalled to return false after uninstall in worktree")
+	}
+}
+
+func TestScriptTemplateNohupProtection(t *testing.T) {
+	t.Parallel()
+
+	template := ScriptTemplate("post-checkout")
+	if !strings.Contains(template, "nohup branchbase hook-trigger post-checkout") {
+		t.Errorf("expected ScriptTemplate to wrap command in nohup, got:\n%s", template)
+	}
+	if !strings.Contains(template, "(nohup") {
+		t.Errorf("expected ScriptTemplate to use detached subshell (nohup ...), got:\n%s", template)
+	}
+}
+
