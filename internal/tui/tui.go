@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/branchbase/branchbase/internal/config"
 	"github.com/branchbase/branchbase/internal/driver"
@@ -309,7 +311,16 @@ func Run(ctx context.Context, repoPath string, cfg *config.Config, drv driver.Dr
 		model.SetFlash(fmt.Sprintf("Initial load error: %v", err), "error")
 	}
 
-	reader := bufio.NewReader(in)
+	// Put a real terminal into raw mode so keypresses are delivered
+	// immediately and escape sequences (arrow keys) are not echoed back
+	// onto the screen. No-op when input is not a terminal (e.g. pipes).
+	if f, ok := in.(*os.File); ok {
+		if restore, supported := enableRawMode(f); supported {
+			defer restore()
+		}
+	}
+
+	reader := newTerminalKeyReader(in)
 
 	// Hide cursor and clear screen
 	_, _ = fmt.Fprint(out, CursorHide+ClearScreen)
@@ -327,42 +338,12 @@ func Run(ctx context.Context, repoPath string, cfg *config.Config, drv driver.Dr
 		default:
 		}
 
-		b, err := reader.ReadByte()
+		key, err := reader.readKey()
 		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
 			return err
-		}
-
-		var key string
-		switch b {
-		case 27: // Escape character
-			// Check if part of arrow sequence
-			if reader.Buffered() >= 2 {
-				next1, _ := reader.ReadByte()
-				next2, _ := reader.ReadByte()
-				if next1 == '[' {
-					switch next2 {
-					case 'A':
-						key = "up"
-					case 'B':
-						key = "down"
-					case 'C':
-						key = "right"
-					case 'D':
-						key = "left"
-					}
-				}
-			} else {
-				key = "esc"
-			}
-		case '\r', '\n':
-			key = "enter"
-		case 3: // Ctrl+C
-			key = "ctrl+c"
-		default:
-			key = string(b)
 		}
 
 		quit, _ := model.HandleKey(key, ctx)
@@ -373,4 +354,132 @@ func Run(ctx context.Context, repoPath string, cfg *config.Config, drv driver.Dr
 		// Re-render dashboard
 		_, _ = fmt.Fprint(out, ClearScreen+model.RenderView())
 	}
+}
+
+// escSequenceTimeout is how long the key reader waits for the remaining bytes
+// of an escape sequence before treating ESC as a lone Escape keypress.
+// Terminals transmit special keys as multi-byte sequences (e.g. ESC [ A for
+// the up arrow) whose bytes may arrive in separate reads.
+const escSequenceTimeout = 25 * time.Millisecond
+
+// keyEvent is a single byte (or terminal error) produced by the input
+// feeder goroutine of a terminalKeyReader.
+type keyEvent struct {
+	b   byte
+	err error
+}
+
+// terminalKeyReader decodes logical key presses from a byte stream. A feeder
+// goroutine reads bytes as they arrive so that escape sequences can be
+// assembled with a timeout instead of guessing from the buffered byte count.
+type terminalKeyReader struct {
+	events  chan keyEvent
+	pending []byte
+	err     error
+}
+
+func newTerminalKeyReader(r io.Reader) *terminalKeyReader {
+	kr := &terminalKeyReader{events: make(chan keyEvent, 64)}
+	go func() {
+		reader := bufio.NewReader(r)
+		for {
+			b, err := reader.ReadByte()
+			kr.events <- keyEvent{b: b, err: err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return kr
+}
+
+// next returns the next input byte. ok is false when no byte arrived within
+// the timeout (zero timeout blocks indefinitely).
+func (kr *terminalKeyReader) next(timeout time.Duration) (b byte, err error, ok bool) {
+	if len(kr.pending) > 0 {
+		b := kr.pending[0]
+		kr.pending = kr.pending[1:]
+		return b, nil, true
+	}
+	if kr.err != nil {
+		return 0, kr.err, false
+	}
+	if timeout <= 0 {
+		ev := <-kr.events
+		if ev.err != nil {
+			kr.err = ev.err
+			return 0, ev.err, false
+		}
+		return ev.b, nil, true
+	}
+	select {
+	case ev := <-kr.events:
+		if ev.err != nil {
+			kr.err = ev.err
+			return 0, ev.err, false
+		}
+		return ev.b, nil, true
+	case <-time.After(timeout):
+		return 0, nil, false
+	}
+}
+
+// unread returns a byte to the reader so it is delivered by the next call.
+func (kr *terminalKeyReader) unread(b byte) {
+	kr.pending = append([]byte{b}, kr.pending...)
+}
+
+// readKey reads a single key event from the terminal input, decoding
+// multi-byte escape sequences into logical key names understood by HandleKey.
+func (kr *terminalKeyReader) readKey() (string, error) {
+	b, err, _ := kr.next(0)
+	if err != nil {
+		return "", err
+	}
+
+	switch b {
+	case 0x1b: // Escape character, possibly introducing an escape sequence
+		return kr.readEscapeSequence(), nil
+	case '\r', '\n':
+		return "enter", nil
+	case 0x03: // Ctrl+C
+		return "ctrl+c", nil
+	default:
+		return string(b), nil
+	}
+}
+
+// readEscapeSequence parses the bytes following an ESC introducer. Arrow keys
+// arrive as ESC [ A/B/C/D (or ESC O A/B/C/D in application mode). If no
+// further bytes arrive promptly, the keypress was a lone Escape.
+func (kr *terminalKeyReader) readEscapeSequence() string {
+	introducer, err, ok := kr.next(escSequenceTimeout)
+	if err != nil {
+		return "esc"
+	}
+	if !ok {
+		return "esc"
+	}
+	if introducer != '[' && introducer != 'O' {
+		// Not a recognized escape sequence: the byte belongs to the next
+		// keypress, so put it back and report the lone Escape.
+		kr.unread(introducer)
+		return "esc"
+	}
+
+	final, err, ok := kr.next(escSequenceTimeout)
+	if err != nil || !ok {
+		return "esc"
+	}
+	switch final {
+	case 'A':
+		return "up"
+	case 'B':
+		return "down"
+	case 'C':
+		return "right"
+	case 'D':
+		return "left"
+	}
+	return ""
 }

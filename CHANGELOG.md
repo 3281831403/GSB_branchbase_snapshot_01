@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- SQLite branch snapshots (`CreateBranch`) now verify the copied database file and WAL against concurrent writers and retry until the snapshot provably reflects a single point in time, eliminating silently missing committed transactions when snapshotting under write load.
+- Proxy TLS connections are now removed from the active connection set after upgrading to TLS, fixing a connection-tracking leak that accumulated stale entries for the lifetime of the server.
+- TUI arrow keys now work reliably: escape sequences are decoded with a timeout-tolerant parser (bytes may arrive in separate reads) and the terminal is put into raw mode so keypresses are no longer echoed as stray escape characters.
 - Compare `DatabaseNameForBranch` against a sanitized `DefaultBranch` so names like `release/v1` resolve to the base database instead of `base_release_v1` (#91).
 
 ## [0.3.0] - 2026-09-16

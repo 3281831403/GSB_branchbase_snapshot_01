@@ -145,22 +145,11 @@ func (d *SqliteDriver) CreateBranch(ctx context.Context, sourceBranch, targetBra
 		return fmt.Errorf("failed to create destination directory for %q: %w", targetPath, err)
 	}
 
-	// Clean up any stale target database files
-	_ = os.Remove(targetPath)
-	_ = os.Remove(targetPath + "-wal")
-	_ = os.Remove(targetPath + "-shm")
-
-	// Snapshot primary database file
-	if err := CloneFile(sourcePath, targetPath); err != nil {
+	// Snapshot the database file together with its WAL/SHM sidecars, verifying
+	// the copy against concurrent writers and checkpoints until it is
+	// guaranteed to reflect a single consistent point in time.
+	if err := snapshotDatabase(ctx, sourcePath, targetPath); err != nil {
 		return fmt.Errorf("failed to snapshot sqlite database from %q to %q: %w", sourcePath, targetPath, err)
-	}
-
-	// Also clone WAL and SHM files if present for consistent crash-recovery state
-	if _, err := os.Stat(sourcePath + "-wal"); err == nil {
-		_ = CloneFile(sourcePath+"-wal", targetPath+"-wal")
-	}
-	if _, err := os.Stat(sourcePath + "-shm"); err == nil {
-		_ = CloneFile(sourcePath+"-shm", targetPath+"-shm")
 	}
 
 	return nil

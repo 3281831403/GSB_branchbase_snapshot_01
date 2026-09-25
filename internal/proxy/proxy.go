@@ -417,6 +417,10 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 				log.Printf("[BranchBase Proxy] TLS server handshake error: %v", err)
 				return
 			}
+			// The raw connection is superseded by the TLS wrapper: track only
+			// tlsConn from here on, otherwise the raw connection leaks in the
+			// active connection set for the lifetime of the server.
+			s.removeActiveConn(clientConn)
 			s.addActiveConn(tlsConn)
 			defer s.removeActiveConn(tlsConn)
 			clientConn = tlsConn
